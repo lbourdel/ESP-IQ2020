@@ -13,6 +13,9 @@
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
+#ifdef USE_IQ2020_BUTTON
+#include "esphome/components/button/button.h"
+#endif
 
 #include <memory>
 #include <string>
@@ -61,6 +64,27 @@
 #define NUMBER_LIGHTS2_INTENSITY 8     // Bartop lights intensity (0 to 5)
 #define NUMBER_LIGHTS3_INTENSITY 9     // Pillow lights intensity (0 to 5)
 #define NUMBER_LIGHTS4_INTENSITY 10    // Exterior lights intensity (0 to 5)
+#define BUTTONCOUNT 3
+#define BUTTON_SALT_TEST 0
+#define BUTTON_RESET_CARTRIDGE 1
+#define BUTTON_CONFIRM_MANUAL_TEST 2
+
+// Coolzone heat pump modes (data byte 'aa' of command 0x1D07)
+#define COOLZONE_MODE_HEAT_BOOST 0x00
+#define COOLZONE_MODE_HEAT_SAVER 0x01
+#define COOLZONE_MODE_CHILL      0x02
+#define COOLZONE_MODE_AUTO_BOOST 0x03
+#define COOLZONE_MODE_AUTO_SAVER 0x04
+// Coolzone compressor states (data byte 'bb' of command 0x1D07)
+#define COOLZONE_STATE_OFF       0x00
+#define COOLZONE_STATE_STANDBY   0x01
+#define COOLZONE_STATE_HEATING   0x02
+#define COOLZONE_STATE_COOLING   0x04
+// Climate action codes passed to the climate component
+#define CLIMATE_ACT_OFF     0
+#define CLIMATE_ACT_IDLE    1
+#define CLIMATE_ACT_HEATING 2
+#define CLIMATE_ACT_COOLING 3
 #define NOT_SET -127
 
 class IQ2020Component : public esphome::Component, public esphome::api::CustomAPIDevice {
@@ -76,7 +100,10 @@ public:
 	void set_freshwater_emulation(bool freshwater_emulation) { this->freshwater_emulation_ = freshwater_emulation; }
 	void set_audio_emulation(bool audio_emulation) { this->audio_emulation_ = audio_emulation; }
 	void set_active(bool active) { this->active_ = active; setSwitchState(SWITCH_ACTIVE, active_); }
+	void set_delay_start(int delay_start) { this->delay_start_ = delay_start; }
 	void set_old_clock(bool old_clock) { this->old_clock_ = old_clock; }
+	void set_coolzone_enabled(bool coolzone_enabled) { this->coolzone_enabled_ = coolzone_enabled; }
+	bool isCoolzoneEnabled() { return this->coolzone_enabled_; }
 	void set_polling_rate(int polling_rate) { this->polling_rate_ = polling_rate; }
 #ifdef USE_BINARY_SENSOR
 	void set_connected_sensor(esphome::binary_sensor::BinarySensor *connected) { this->connected_sensor_ = connected; }
@@ -132,15 +159,26 @@ public:
 	void set_iq_va_sensor(esphome::sensor::Sensor *sensor) { this->iq_va_sensor_ = sensor; }
 	void set_iq_vb_sensor(esphome::sensor::Sensor *sensor) { this->iq_vb_sensor_ = sensor; }
 	void set_iq_vc_sensor(esphome::sensor::Sensor *sensor) { this->iq_vc_sensor_ = sensor; }
-	void set_iq_vd_sensor(esphome::sensor::Sensor *sensor) { this->iq_vd_sensor_ = sensor; }
+	void set_iq_orp_sensor(esphome::sensor::Sensor *sensor) { this->iq_orp_sensor_ = sensor; }
 	void set_iq_chlorine_sensor(esphome::sensor::Sensor *sensor) { this->iq_chlorine_sensor_ = sensor; }
 	void set_iq_ph_sensor(esphome::sensor::Sensor *sensor) { this->iq_ph_sensor_ = sensor; }
 	void set_iq_hoursleft_sensor(esphome::sensor::Sensor *sensor) { this->iq_hoursleft_sensor_ = sensor; }
 	void set_rtc_timestamp_sensor(esphome::sensor::Sensor *sensor) { this->rtc_timestamp_sensor_ = sensor; }
+	void set_coolzone_mode_raw_sensor(esphome::sensor::Sensor *sensor) { this->coolzone_mode_raw_sensor_ = sensor; }
+	void set_coolzone_state_raw_sensor(esphome::sensor::Sensor *sensor) { this->coolzone_state_raw_sensor_ = sensor; }
+	void set_salt_cartridge_age_days_sensor(esphome::sensor::Sensor *sensor) { this->salt_cartridge_age_days_sensor_ = sensor; }
+	void set_salt_days_since_manual_test_sensor(esphome::sensor::Sensor *sensor) { this->salt_days_since_manual_test_sensor_ = sensor; }
+	void set_salt_generation_hours_sensor(esphome::sensor::Sensor *sensor) { this->salt_generation_hours_sensor_ = sensor; }
+	void set_salt_error_code_sensor(esphome::sensor::Sensor *sensor) { this->salt_error_code_sensor_ = sensor; }
 #endif
 #ifdef USE_TEXT_SENSOR
 	void set_version_sensor(esphome::text_sensor::TextSensor *text) { this->version_sensor_ = text; }
 	void set_rtc_datetime_sensor(esphome::text_sensor::TextSensor *text) { this->rtc_datetime_sensor_ = text; }
+	void set_salt_module_status_sensor(esphome::text_sensor::TextSensor *text) { this->salt_module_status_sensor_ = text; }
+	void set_salt_level_friendly_sensor(esphome::text_sensor::TextSensor *text) { this->salt_level_friendly_sensor_ = text; }
+#endif
+#ifdef USE_IQ2020_BUTTON
+	void buttonAction(unsigned int buttonid);
 #endif
 
 	void setup() override;
@@ -152,13 +190,14 @@ public:
 
 	void set_port(uint16_t port) { this->port_ = port; }
 	void switchAction(unsigned int switchid, int state);
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 	void selectAction(unsigned int selectid, int state);
 #endif
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 	void numberAction(unsigned int numberid, int state);
 #endif
 	void setTempAction(float newtemp);
+	void setCoolzoneMode(int mode);
 	void setTime(int hour, int minute, int second, int year, int month, int day);
 
 protected:
@@ -196,7 +235,10 @@ protected:
 	bool freshwater_emulation_;
 	bool audio_emulation_;
 	bool active_;
+	int delay_start_ = 30;              // Seconds to keep active off at boot before switching it on
+	unsigned long activate_at_ = 0;     // millis timestamp to switch active on (0 = nothing scheduled)
 	bool old_clock_;
+	bool coolzone_enabled_ = false;
 	unsigned char audio_module_address = 0x33; // There are two audio modules at 0x33 or 0x1D.
 	int polling_rate_;
 
@@ -254,15 +296,23 @@ protected:
 	esphome::sensor::Sensor *iq_va_sensor_;
 	esphome::sensor::Sensor *iq_vb_sensor_;
 	esphome::sensor::Sensor *iq_vc_sensor_;
-	esphome::sensor::Sensor *iq_vd_sensor_;
+	esphome::sensor::Sensor *iq_orp_sensor_;
 	esphome::sensor::Sensor *iq_chlorine_sensor_;
 	esphome::sensor::Sensor *iq_ph_sensor_;
 	esphome::sensor::Sensor *iq_hoursleft_sensor_;
 	esphome::sensor::Sensor *rtc_timestamp_sensor_;
+	esphome::sensor::Sensor *coolzone_mode_raw_sensor_;
+	esphome::sensor::Sensor *coolzone_state_raw_sensor_;
+	esphome::sensor::Sensor *salt_cartridge_age_days_sensor_;
+	esphome::sensor::Sensor *salt_days_since_manual_test_sensor_;
+	esphome::sensor::Sensor *salt_generation_hours_sensor_;
+	esphome::sensor::Sensor *salt_error_code_sensor_;
 #endif
 #ifdef USE_TEXT_SENSOR
 	esphome::text_sensor::TextSensor *version_sensor_;
 	esphome::text_sensor::TextSensor *rtc_datetime_sensor_;
+	esphome::text_sensor::TextSensor *salt_module_status_sensor_;
+	esphome::text_sensor::TextSensor *salt_level_friendly_sensor_;
 #endif
 
 	std::unique_ptr<uint8_t[]> buf_{};
@@ -274,19 +324,24 @@ protected:
 	std::string versionstr;
 	int switch_state[SWITCHCOUNT];   // Current state of all switches
 	int switch_pending[SWITCHCOUNT]; // Desired state of all switches
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 	int select_state[SELECTCOUNT];   // Current state of all selects
 	int select_pending[SELECTCOUNT]; // Desired state of all selects
 #endif
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 	int number_state[NUMBERCOUNT];   // Current state of all numbers
 	int number_pending[NUMBERCOUNT]; // Desired state of all numbers
 #endif
 	unsigned long connectionKit = 0; // The time the spa connection kit was last seen
+	int version_poll_count = 0;     // Number of version poll attempts made
+	bool version_polling_done = false; // Stop gating polling on the version string (got it, gave up, or not configured)
 	int got_audio_data = 0;
 	int got_iq_data = 0;
 	bool temp_celsius = false;
 	int temp_action = NOT_SET;
+	int coolzone_mode = NOT_SET;    // Last known coolzone mode (0x00 to 0x04)
+	int coolzone_state = NOT_SET;  // Last known coolzone compressor state (0x00, 0x01, 0x02, 0x04)
+	int coolzone_present = NOT_SET; // -127 unknown, 0 not installed (FFFF), 1 installed
 	float target_temp = NOT_SET;
 	float current_temp = NOT_SET;
 	float outlet_temp = NOT_SET;
@@ -299,6 +354,7 @@ protected:
 	int next_retry_count = 0;
 	int salt_power = NOT_SET; // This is polled too frequently to send to HA each time.
 	int salt_content = NOT_SET; // This is polled too frequently to send to HA each time.
+	unsigned char salt_module_address = 0x29; // Last seen salt module address (0x24 legacy ACE, 0x29 freshwater salt).
 	std::string audio_song_title;
 	std::string audio_artist_name;
 
@@ -314,6 +370,7 @@ protected:
 	void setSelectState(unsigned int selectid, int state);
 	void setNumberState(unsigned int numberid, int value);
 	void pollState();
+	int climateActionCode();
 };
 
 extern IQ2020Component* g_iq2020_main;

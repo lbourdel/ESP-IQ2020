@@ -22,7 +22,7 @@ You could try to [create a better cable](https://github.com/Ylianst/ESP-IQ2020/b
 <details>
 <summary>Sample ESP-Home configuration file</summary>
 
-```
+```yaml
 esphome:
   name: hot-tub
   friendly_name: Hot Tub
@@ -64,7 +64,8 @@ uart:
 iq2020:
    uart_id: SpaConnection
    polling_rate: 65
-   port: 1234
+   # A port may be configured to debug RS485 traffic as described in documentation/debugging.md.
+   # port: 1234
 
 # If using Celsius units on the hot tub remote, replace _f_ with _c_ in the three entries below.
 # Feel free to remove any sensor that are not relevant for your hot tub.
@@ -150,7 +151,7 @@ Next, power off your hot tub and connect your new device like this:
 
 ![image](https://github.com/user-attachments/assets/98956d57-a019-4aae-a9b1-cd4c24e18b67)
 
-In the picture below you will notice I have the expansion board attached with 8 expansion connectors, your hot tub will generally have 1 or 2 expansion connectors. If they are all busy, you will need to get an expansion board. Double check all the wires, you should not need to force anything, the wires should fit just right.
+In the picture below you will notice I have the expansion board (Part #74150) attached with 8 expansion connectors, your hot tub will generally have 1 or 2 expansion connectors. If they are all busy, you will need to get an expansion board. Double check all the wires, you should not need to force anything, the wires should fit just right.
 
 ![IQ2020-ESP3](https://github.com/Ylianst/ESP-IQ2020/assets/1319013/c52b676b-e35c-474c-8919-2fc57302d0fb)
 
@@ -160,6 +161,7 @@ For added features and details:
   - [More Sensors, Templates and Extras](https://github.com/Ylianst/ESP-IQ2020/blob/main/documentation/extras.md)
   - [Audio Module Emulation](https://github.com/Ylianst/ESP-IQ2020/blob/main/documentation/audio.md)
   - [ACE Module Emulation](https://github.com/Ylianst/ESP-IQ2020/blob/main/documentation/ace.md)
+  - [Coolzone Heat Pump Support](https://github.com/Ylianst/ESP-IQ2020/blob/main/documentation/coolzone.md)
   - [Using different ESP32 devices](https://github.com/Ylianst/ESP-IQ2020/blob/main/documentation/devices.md)
   - [Details on the RS485 serial protocol](https://github.com/Ylianst/ESP-IQ2020/blob/main/documentation/protocol.md)
   - [Debugging RS485 traffic](https://github.com/Ylianst/ESP-IQ2020/blob/main/documentation/debugging.md)

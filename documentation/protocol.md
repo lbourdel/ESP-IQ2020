@@ -47,9 +47,10 @@ The source address is 0x01 which is the address of the IQ2020 controller on the 
 0x21 - Coolzone
 0x24 - ACE Salt System
 0x29 - Freshwater Salt System
+0x32 - Unknown module
 0x33 - Audio/Music
 0x37 - Freshwater IQ
-0x38 - Unknown module
+0x38 - Water Clarity Sensor (optical/turbidity)
 0x1D - Audio/Music
 0x1F - Spa Connection Kit
 ```
@@ -143,7 +144,7 @@ Every hour, we see this `0x23D1` command. This seems to contain the Chlorine, Ph
 AA = Unknown, always zero.
 BB = Unknown, always zero.
 CC = Unknown, 32 bit small-endian.
-DD = Unknown, 32 bit small-endian.
+DD = ORP (Oxidation-Reduction Potential) in millivolts, 32 bit small-endian. Typical healthy range is roughly 650-750 mV.
 EE = Chlorine in 10ths of PPM, 32 bit small-endian, Convert to decimal and divide by 10.
 FF = Ph in 10ths, 32 bit small-endian, Convert to decimal and divide by 10.
 GG = Hours remaining count-down, 32 bit small-endian.
@@ -158,6 +159,61 @@ This next command is completely unknown. It seems to contain 9 x 32 bit integers
 
 All values are unknown.
 ```
+
+# Water Clarity Sensor
+
+The module on address `0x38` appears to be an optical water clarity / turbidity
+sensor. In every capture the IQ2020 controller (`0x01`) polls it about every 5
+seconds with two commands. Only the first ever gets a reply:
+
+```
+<-- 38 01 40 2401      <-- Request (read sensor)
+<-- 01 38 80 2401...   <-- Response (data below)
+<-- 38 01 40 24050F    <-- Set command (param 0x0F), never answered
+```
+
+Command `0x2405` is never acknowledged in any capture, so it looks like a
+write/set command (possibly sensor gain, LED drive or sample configuration)
+rather than a query.
+
+The `0x2401` response is 50 bytes and decodes as follows:
+
+```
+01 38 80 2401 3234303130354631 0106 3C80 03C803C8...(x16) 008000D0
+
+2401              - Command echo.
+3234303130354631  - "240105F1" ASCII, the module model/part string (constant).
+0106              - Status / type header (constant).
+3C80              - 16-bit Big-Endian sum of the 16 samples below.
+03C8 x16          - 16 rolling sensor samples (16-bit Big-Endian, ~10-bit ADC).
+008000D0          - Trailer / flags (constant across all captures).
+```
+
+The leading 16-bit value is always exactly the sum of the 16 samples that follow
+(sum = 16 x sample), so it is a running accumulator used for averaging. The 16
+samples are individual noisy readings of a single sensor value (they jitter by
+1 LSB between each other in some captures).
+
+The measured value behaves like a ~10-bit ADC (full scale 1023) reading of an
+optical clarity / turbidity sensor:
+
+```
+Still standby water         ~968  (0x03C8)  - clear, undisturbed water
+Temperature / spa lock      ~938  (0x03AA)
+Scheduled clean cycle       ~960  (0x03C0)
+Jets / cleaning / heater on  ~84  (0x0054)  - aerated, bubbly water
+```
+
+The reading sits near full scale when the tub is in still standby and collapses
+by roughly 10x whenever the water is being circulated or aerated (jets, cleaning
+cycle, or heater/circulation pump running), consistent with bubbles and flow
+scattering the sensor's light path. Turning the tub lights on does not change
+the reading, so it is not an ambient/visible-light sensor.
+
+The exact physical unit and the meaning of the `0106` and `008000D0` constants
+are not yet confirmed; a capture where the reading sweeps through intermediate
+values (e.g. water gradually clearing after the jets stop) would help verify the
+scaling.
 
 # Spa Connection Kit
 
@@ -598,7 +654,7 @@ Return song/artist name
 Poll for heat pump status
 ```
 01 1F 40 1D07 FF
-1F 01 80 1D07 FFFF
+1F 01 80 1D07 0101
 ```
 
 Heat pump data is as follows
@@ -607,11 +663,105 @@ Heat pump data is as follows
 01        - Source IQ2020 (0x01).
 80        - Response (0x40 = Request, 0x80 = Response).
 1D07      - Command 0x1D07 Heat Pump Status
-FF        - Heat pump current operational status
-FF        - Heat pump current mode setting
+01        - Heat pump current mode setting
+01        - Heat pump current compressor state
 ```
+
+See the [Coolzone](#coolzone) section below for the full list of modes and
+compressor states.
 
 IQ2020 Reboot Command
 ```
 01 1F 40 0273 3487E5
+```
+
+# Coolzone
+
+The Coolzone is an optional heat pump that can be attached to the hot tub. In
+addition to heating the water, it can also actively cool it, which makes it
+useful in warm climates. On the RS485 bus the Coolzone module uses address
+`0x21`, but the mode is read and controlled by the IQ2020 controller through the
+Spa Connection Kit (`0x1F`) using command `0x1D07`.
+
+All Coolzone commands and responses use the `0x1D07` command. Requests are sent
+from the Spa Connection Kit (`0x1F`) to the IQ2020 controller (`0x01`) and the
+controller replies back to `0x1F`.
+
+Every response is two data bytes following the command:
+
+```
+1F 01 80 1D07 aabb
+
+aa = Current heat pump mode
+bb = Current compressor state
+```
+
+The `aa` mode byte can be one of the following five values:
+
+```
+0x00 - Heat w/Boost
+0x01 - Heat Saver
+0x02 - Chill
+0x03 - Auto w/Boost
+0x04 - Auto Saver
+```
+
+The `/Boost` modes (Heat w/Boost and Auto w/Boost) are modes where the
+controller is allowed to use the hot tub's induction heating in addition to the
+heat pump. This heats the water faster at the cost of using more power. The
+non-boost modes (Heat Saver, Chill and Auto Saver) rely on the heat pump alone.
+
+
+The `bb` compressor state byte indicates what the compressor is currently doing.
+The compressor can be idle, or run in either direction to heat or cool the
+water:
+
+```
+0x00 - Off (assumed, not yet observed in captures)
+0x01 - Standby
+0x02 - Heating
+0x04 - Cooling
+```
+
+If the response is `1F 01 80 1D07 FFFF` (both bytes `0xFF`), the Coolzone heat
+pump is not installed.
+
+To poll the current mode and compressor state, send the mode byte `0xFF`:
+
+```
+01 1F 40 1D07 FF      <-- Request current state
+1F 01 80 1D07 0101    <-- Response: mode 0x01 (Heat Saver), compressor 0x01 (Standby)
+```
+
+To set a mode, send the desired mode byte followed by `0x00`. The controller
+responds with the new mode and the current compressor state.
+
+Heat w/Boost
+```
+01 1F 40 1D07 0000    <-- Set mode 0x00 (Heat w/Boost)
+1F 01 80 1D07 0001    <-- Response: mode 0x00, compressor 0x01 (Standby)
+```
+
+Heat Saver
+```
+01 1F 40 1D07 0100    <-- Set mode 0x01 (Heat Saver)
+1F 01 80 1D07 0104    <-- Response: mode 0x01, compressor 0x04 (Cooling)
+```
+
+Chill
+```
+01 1F 40 1D07 0200    <-- Set mode 0x02 (Chill)
+1F 01 80 1D07 0204    <-- Response: mode 0x02, compressor 0x04 (Cooling)
+```
+
+Auto w/Boost
+```
+01 1F 40 1D07 0300    <-- Set mode 0x03 (Auto w/Boost)
+1F 01 80 1D07 0304    <-- Response: mode 0x03, compressor 0x04 (Cooling)
+```
+
+Auto Saver
+```
+01 1F 40 1D07 0400    <-- Set mode 0x04 (Auto Saver)
+1F 01 80 1D07 0404    <-- Response: mode 0x04, compressor 0x04 (Cooling)
 ```

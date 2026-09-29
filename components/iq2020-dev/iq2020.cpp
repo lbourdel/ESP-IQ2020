@@ -1,13 +1,16 @@
 #include "iq2020.h"
 #include "fan/iq2020_fan.h"
 #include "switch/iq2020_switch.h"
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_BUTTON
+#include "button/iq2020_button.h"
+#endif
+#ifdef USE_IQ2020_SELECT
 #include "select/iq2020_select.h"
 #endif
-#ifdef USE_TEXT
+#ifdef USE_IQ2020_TEXT
 #include "text/iq2020_text.h"
 #endif
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 #include "number/iq2020_number.h"
 #endif
 #include "climate/iq2020_climate.h"
@@ -25,15 +28,18 @@ static const char* TAG = "iq2020";
 // These globals are ugly, but I can't figure out the correct system yet.
 IQ2020Component* g_iq2020_main = NULL;
 esphome::iq2020_switch::IQ2020Switch* g_iq2020_switch[SWITCHCOUNT];
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 esphome::iq2020_select::IQ2020Select* g_iq2020_select[SELECTCOUNT];
 #endif
-#ifdef USE_TEXT
+#ifdef USE_IQ2020_TEXT
 esphome::iq2020_text::IQ2020Text* g_iq2020_text[TEXTCOUNT];
 #endif
 esphome::iq2020_fan::IQ2020Fan* g_iq2020_fan[FANCOUNT];
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 esphome::iq2020_number::IQ2020Number* g_iq2020_number[NUMBERCOUNT];
+#endif
+#ifdef USE_IQ2020_BUTTON
+esphome::iq2020_button::IQ2020Button* g_iq2020_button[BUTTONCOUNT];
 #endif
 esphome::iq2020_climate::IQ2020Climate* g_iq2020_climate = NULL;
 
@@ -43,13 +49,20 @@ float fahrenheit_to_celsius(float f) { return (f - 32) * 5 / 9; }
 float celsius_to_fahrenheit(float c) { return c * 9 / 5 + 32; }
 int readCounter(unsigned char* data, int offset) { return (data[offset]) + (data[offset + 1] << 8) + (data[offset + 2] << 16) + (data[offset + 3] << 24); }
 int readCounterEx(unsigned char* data, int offset) { return (data[offset] << 24) + (data[offset + 1] << 16) + (data[offset + 2] << 8) + (data[offset + 3]); }
+static const char *salt_level_friendly_text(int salt_level) {
+	if (salt_level <= 24) return "red-low";
+	if (salt_level <= 36) return "yellow-low";
+	if (salt_level <= 84) return "green";
+	if (salt_level <= 96) return "yellow-high";
+	return "red-high";
+}
 
 void IQ2020Component::setup() {
 	for (int i = 0; i < SWITCHCOUNT; i++) { switch_state[i] = switch_pending[i] = NOT_SET; }
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 	for (int i = 0; i < SELECTCOUNT; i++) { select_state[i] = select_pending[i] = NOT_SET; }
 #endif
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 	for (int i = 0; i < NUMBERCOUNT; i++) { number_state[i] = number_pending[i] = NOT_SET; }
 #endif
 
@@ -79,9 +92,20 @@ void IQ2020Component::setup() {
 
 	this->publish_sensor();
 
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 	setNumberState(NUMBER_SALT_STATUS, ace_status);
 #endif
+
+	// Enable coolzone modes on the climate control if configured. This runs after the climate
+	// component's own setup(), so g_iq2020_climate is available here.
+	if (coolzone_enabled_ && (g_iq2020_climate != NULL)) { g_iq2020_climate->enableCoolzone(); }
+
+	// If configured active, hold off by starting inactive and switching active on after delay_start_ seconds.
+	if (active_ && (delay_start_ > 0)) {
+		active_ = false;
+		setSwitchState(SWITCH_ACTIVE, false);
+		activate_at_ = ::millis() + (delay_start_ * 1000);
+	}
 
 	// Send initial polling commands
 	next_poll = ::millis() + 5000;
@@ -96,6 +120,11 @@ void IQ2020Component::loop() {
 	this->cleanup();
 
 	unsigned long now = ::millis();
+	// Startup delay expired: switch active on, same as an automation toggling it to true.
+	if ((activate_at_ != 0) && (now >= activate_at_)) {
+		activate_at_ = 0;
+		set_active(true);
+	}
 	// Check if there is any pending commands that need retry
 	if ((next_retry_count > 0) && (next_retry < now)) {
 		for (int switchid = 0; switchid < SWITCHCOUNT; switchid++) {
@@ -107,7 +136,7 @@ void IQ2020Component::loop() {
 				break; // Only retry one command
 			}
 		}
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 		for (int selectid = 0; selectid < SELECTCOUNT; selectid++) {
 			if (select_pending[selectid] != NOT_SET) {
 				ESP_LOGE(TAG, "Retry select %d set to %d", selectid, select_pending[selectid]);
@@ -118,7 +147,7 @@ void IQ2020Component::loop() {
 			}
 		}
 #endif
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 		for (int numberid = 0; numberid < NUMBERCOUNT; numberid++) {
 			if (number_pending[numberid] != NOT_SET) {
 				ESP_LOGE(TAG, "Retry number %d set to %d", numberid, number_pending[numberid]);
@@ -157,7 +186,12 @@ void IQ2020Component::loop() {
 
 void IQ2020Component::dump_config() {
 	ESP_LOGCONFIG(TAG, "IQ2020:");
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 7, 0)
+	char use_address_buf[esphome::network::USE_ADDRESS_BUFFER_SIZE];
+	ESP_LOGCONFIG(TAG, "  Address: %s:%u", esphome::network::get_use_address_to(use_address_buf), this->port_);
+#else
 	ESP_LOGCONFIG(TAG, "  Address: %s:%u", esphome::network::get_use_address(), this->port_);
+#endif
 	if (this->flow_control_pin_ != nullptr) {
 		ESP_LOGCONFIG(TAG, "  Flow Control Pin: ", this->flow_control_pin_);
 	}
@@ -194,6 +228,7 @@ void IQ2020Component::publish_sensor() {
 }
 
 void IQ2020Component::accept() {
+    if (!this->socket_) return;
 	struct sockaddr_storage client_addr;
 	socklen_t client_addrlen = sizeof(client_addr);
 	std::unique_ptr<socket::Socket> socket = this->socket_->accept(reinterpret_cast<struct sockaddr*>(&client_addr), &client_addrlen);
@@ -377,7 +412,7 @@ int IQ2020Component::processIQ2020Command() {
 				}
 			}
 			else if ((processingBuffer[6] == 0x03) && (cmdlen == 9)) { // Audio source
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 				setSelectState(SELECT_AUDIO_SOURCE, processingBuffer[7]);
 #endif
 			}
@@ -386,7 +421,7 @@ int IQ2020Component::processIQ2020Command() {
 				// processingBuffer[7] == 0x01 -- On
 				// processingBuffer[7] == 0x02 -- Off
 				//setSwitchState(SWITCH_AUDIO_POWER, (int)(processingBuffer[7] == 0x1));
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 				ESP_LOGD(TAG, "AUDIO - Power=%d, Volume=%d, Treble=%d, Bass=%d, Balance=%d, Subwoofer=%d", processingBuffer[7], processingBuffer[8], processingBuffer[9], processingBuffer[10], processingBuffer[11], processingBuffer[12]);
 				if (audio_module_address == 0x33) { // 0x33
 					setNumberState(NUMBER_AUDIO_VOLUME, (processingBuffer[8] - 15) << 2);
@@ -405,7 +440,7 @@ int IQ2020Component::processIQ2020Command() {
 				char text[22];
 				text[0] = 0x19;
 				text[1] = 0x06;
-#ifdef USE_TEXT
+#ifdef USE_IQ2020_TEXT
 				if (g_iq2020_text[TEXT_SONG_TITLE] != NULL) {
 					text_len += g_iq2020_text[TEXT_SONG_TITLE]->text_value.size();
 					memcpy(text + 2, g_iq2020_text[TEXT_SONG_TITLE]->text_value.c_str(), text_len - 2);
@@ -421,7 +456,7 @@ int IQ2020Component::processIQ2020Command() {
 				char text[22];
 				text[0] = 0x19;
 				text[1] = 0x07;
-#ifdef USE_TEXT
+#ifdef USE_IQ2020_TEXT
 				if (g_iq2020_text[TEXT_ARTIST_NAME] != NULL) {
 					text_len += g_iq2020_text[TEXT_ARTIST_NAME]->text_value.size();
 					memcpy(text + 2, g_iq2020_text[TEXT_ARTIST_NAME]->text_value.c_str(), text_len - 2);
@@ -474,7 +509,7 @@ int IQ2020Component::processIQ2020Command() {
 		int iq_va = readCounterEx(processingBuffer, 7);  // Unknown value, always zero
 		int iq_vb = readCounterEx(processingBuffer, 11); // Unknown value, always zero
 		int iq_vc = readCounterEx(processingBuffer, 15); // Unknown value
-		int iq_vd = readCounterEx(processingBuffer, 19); // Unknown value
+		int iq_orp = readCounterEx(processingBuffer, 19); // ORP (Oxidation-Reduction Potential) in millivolts
 		int iq_ve = readCounterEx(processingBuffer, 23); // Chlorine level
 		int iq_vf = readCounterEx(processingBuffer, 27); // Ph Level
 		int iq_vg = readCounterEx(processingBuffer, 31); // Cartridge life countdown.
@@ -483,7 +518,7 @@ int IQ2020Component::processIQ2020Command() {
 		if (this->iq_va_sensor_) this->iq_va_sensor_->publish_state((float)iq_va);
 		if (this->iq_vb_sensor_) this->iq_vb_sensor_->publish_state((float)iq_vb);
 		if (this->iq_vc_sensor_) this->iq_vc_sensor_->publish_state((float)iq_vc);
-		if (this->iq_vd_sensor_) this->iq_vd_sensor_->publish_state((float)iq_vd);
+		if (this->iq_orp_sensor_) this->iq_orp_sensor_->publish_state((float)iq_orp);
 		if (this->iq_chlorine_sensor_) this->iq_chlorine_sensor_->publish_state(((float)iq_ve) / 10);
 		if (this->iq_ph_sensor_) this->iq_ph_sensor_->publish_state(((float)iq_vf) / 10);
 		if (this->iq_hoursleft_sensor_) this->iq_hoursleft_sensor_->publish_state((float)iq_vg);
@@ -494,7 +529,8 @@ int IQ2020Component::processIQ2020Command() {
 	if (((processingBuffer[1] == 0x24) || (processingBuffer[1] == 0x29)) && (processingBuffer[2] == 0x01) && (processingBuffer[4] == 0x40) && (cmdlen == 21) && (processingBuffer[5] == 0x1E) && (processingBuffer[6] == 0x01)) {
 		// This is a command from IQ2020 to the Salt System
 		//ESP_LOGD(TAG, "Salt REQ Data, len=%d, cmd=%02x%02x", cmdlen, processingBuffer[5], processingBuffer[6]);
-#ifdef USE_NUMBER
+		salt_module_address = processingBuffer[1];
+#ifdef USE_IQ2020_NUMBER
 		if (processingBuffer[7] <= 10) { setNumberState(NUMBER_SALT_POWER, processingBuffer[7]); }
 #endif
 
@@ -509,7 +545,7 @@ int IQ2020Component::processIQ2020Command() {
 		if (ace_emulation_ && (processingBuffer[1] == 0x24)) {
 			if (processingBuffer[7] <= 10) {
 				salt_power = processingBuffer[7];
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 				setNumberState(NUMBER_SALT_POWER, salt_power);
 #endif
 			}
@@ -533,7 +569,7 @@ int IQ2020Component::processIQ2020Command() {
 		else if (freshwater_emulation_ && (processingBuffer[1] == 0x29)) {
 			if (processingBuffer[7] <= 10) {
 				salt_power = processingBuffer[7];
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 				setNumberState(NUMBER_SALT_POWER, salt_power);
 #endif
 			}
@@ -547,19 +583,68 @@ int IQ2020Component::processIQ2020Command() {
 	if ((processingBuffer[1] == 0x01) && ((processingBuffer[2] == 0x24) || (processingBuffer[2] == 0x29)) && (processingBuffer[4] == 0x80) && (cmdlen == 21) && (processingBuffer[5] == 0x1E) && (processingBuffer[6] == 0x01)) {
 		// This is a reply command from the Salt System to the IQ2020
 		//ESP_LOGD(TAG, "Salt RSP Data, len=%d, cmd=%02x%02x, power=%d", cmdlen, processingBuffer[5], processingBuffer[6], processingBuffer[7]);
+		if ((processingBuffer[2] == 0x24) || (processingBuffer[2] == 0x29)) {
+			salt_module_address = processingBuffer[2];
+		}
 		if ((processingBuffer[7] <= 10) && (salt_power != processingBuffer[7])) {
 			salt_power = processingBuffer[7];
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 			setNumberState(NUMBER_SALT_POWER, salt_power);
 #endif
 		}
-		if (salt_content != processingBuffer[9]) {
-			salt_content = processingBuffer[9] >> 4;
+		int decoded_salt_content = processingBuffer[9];
+		// Preserve legacy ACE behavior (0x24) while using freshwater salt decoding for 0x29.
+		if (salt_module_address == 0x24) {
+			decoded_salt_content = processingBuffer[9] >> 4;
+		}
+		if (salt_content != decoded_salt_content) {
+			salt_content = decoded_salt_content;
 #ifdef USE_SENSOR
 			if (this->salt_content_sensor_) this->salt_content_sensor_->publish_state((float)salt_content);
 #endif
+#ifdef USE_TEXT_SENSOR
+			if (this->salt_level_friendly_sensor_) this->salt_level_friendly_sensor_->publish_state(salt_level_friendly_text(salt_content));
+#endif
 		}
-		setSwitchState(SWITCH_SALT_BOOST, (processingBuffer[12] & 0x04) != 0);
+#ifdef USE_SENSOR
+		if (this->salt_cartridge_age_days_sensor_) {
+			const uint8_t cartridge_age_days = (salt_module_address == 0x29) ? processingBuffer[10] : processingBuffer[8];
+			this->salt_cartridge_age_days_sensor_->publish_state((float) cartridge_age_days);
+		}
+		if (this->salt_days_since_manual_test_sensor_) {
+			this->salt_days_since_manual_test_sensor_->publish_state((float) processingBuffer[8]);
+		}
+		if (this->salt_generation_hours_sensor_) {
+			const uint16_t salt_generation_hours = (salt_module_address == 0x29)
+				? (((uint16_t) processingBuffer[16] << 8) | processingBuffer[15])
+				: processingBuffer[15];
+			this->salt_generation_hours_sensor_->publish_state((float) salt_generation_hours);
+		}
+		if (this->salt_error_code_sensor_) {
+			const uint16_t salt_error_code = ((uint16_t) processingBuffer[13] << 8) | processingBuffer[14];
+			this->salt_error_code_sensor_->publish_state((float) salt_error_code);
+		}
+#endif
+		// Preserve legacy ACE boost bit behavior (0x24) and freshwater MF-based behavior (0x29).
+		if (salt_module_address == 0x24) {
+			setSwitchState(SWITCH_SALT_BOOST, (processingBuffer[12] & 0x04) != 0);
+		}
+		else {
+			setSwitchState(SWITCH_SALT_BOOST, processingBuffer[12] == 0x07);
+		}
+#ifdef USE_TEXT_SENSOR
+		if (this->salt_module_status_sensor_) {
+			if ((processingBuffer[19] & 0x40) != 0) {
+				this->salt_module_status_sensor_->publish_state("idle");
+			}
+			else if ((processingBuffer[19] & 0x80) != 0) {
+				this->salt_module_status_sensor_->publish_state("generating_chlorine");
+			}
+			else {
+				this->salt_module_status_sensor_->publish_state("cleaning_cartridge");
+			}
+		}
+#endif
 	}
 
 	// IQ2020 -> SPA connection kit Response
@@ -569,7 +654,7 @@ int IQ2020Component::processIQ2020Command() {
 
 		if ((cmdlen == 9) && (processingBuffer[5] == 0xE1) && (processingBuffer[6] == 0x02) && (processingBuffer[7] == 0x06)) {
 			// Confirmation that the ACE/Freshwater salt system has changed state (not sure what state however)
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 			setNumberState(NUMBER_SALT_POWER, NOT_SET);
 #endif
 			setSwitchState(SWITCH_SALT_BOOST, NOT_SET);
@@ -578,7 +663,7 @@ int IQ2020Component::processIQ2020Command() {
 		if ((cmdlen == 9) && (processingBuffer[5] == 0x19) && (processingBuffer[6] == 0x00) && (processingBuffer[7] == 0x06)) {
 			// Confirmation that the audio command was received
 			setSwitchState(SWITCH_AUDIO_POWER, NOT_SET);
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 			setSelectState(SELECT_AUDIO_SOURCE, NOT_SET);
 #endif
 		}
@@ -588,10 +673,10 @@ int IQ2020Component::processIQ2020Command() {
 
 			// Status of audio module
 			setSwitchState(SWITCH_AUDIO_POWER, processingBuffer[7]); // Audio Power Status
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 			setSelectState(SELECT_AUDIO_SOURCE, processingBuffer[14]); // Audio Source
 #endif
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 			if (audio_module_address == 0x33) { // 0x33
 				setNumberState(NUMBER_AUDIO_VOLUME, (processingBuffer[8] - 15) << 2);
 			}
@@ -609,9 +694,37 @@ int IQ2020Component::processIQ2020Command() {
 			// Status of the Freshwater Salt System
 			if (salt_power != processingBuffer[7]) {
 				salt_power = processingBuffer[7];
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 				setNumberState(NUMBER_SALT_POWER, salt_power);
 #endif
+			}
+		}
+
+		if ((cmdlen == 10) && (processingBuffer[5] == 0x1D) && (processingBuffer[6] == 0x07)) {
+			// Coolzone heat pump status: 1F 01 80 1D07 aabb (aa = mode, bb = compressor state).
+			// This is processed whether the poll came from us or the official Spa Connection Kit.
+			unsigned char cz_mode = processingBuffer[7];
+			unsigned char cz_state = processingBuffer[8];
+
+			if ((cz_mode == 0xFF) && (cz_state == 0xFF)) {
+				// Coolzone heat pump is not installed.
+				if (coolzone_present != 0) {
+					coolzone_present = 0;
+					ESP_LOGD(TAG, "Coolzone not installed");
+				}
+			}
+			else {
+				coolzone_present = 1;
+				coolzone_mode = cz_mode;
+				coolzone_state = cz_state;
+				ESP_LOGD(TAG, "Coolzone mode=%d, state=%d", coolzone_mode, coolzone_state);
+#ifdef USE_SENSOR
+				if (this->coolzone_mode_raw_sensor_) this->coolzone_mode_raw_sensor_->publish_state((float)coolzone_mode);
+				if (this->coolzone_state_raw_sensor_) this->coolzone_state_raw_sensor_->publish_state((float)coolzone_state);
+#endif
+				if (coolzone_enabled_ && (g_iq2020_climate != NULL)) {
+					g_iq2020_climate->updateCoolzone(coolzone_mode, climateActionCode());
+				}
 			}
 		}
 
@@ -660,7 +773,7 @@ int IQ2020Component::processIQ2020Command() {
 			if (this->lights_color_exterior_sensor_) this->lights_color_exterior_sensor_->publish_state((float)processingBuffer[23]);
 #endif
 
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 			for (int i = 0; i < 4; i++) {
 				int val = processingBuffer[8 + i];
 				if ((number_pending[NUMBER_LIGHTS1_INTENSITY + i] != NOT_SET) && (val != number_pending[NUMBER_LIGHTS1_INTENSITY + i])) {
@@ -673,7 +786,7 @@ int IQ2020Component::processIQ2020Command() {
 			}
 #endif
 
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 			// Fix the lights cycle speed if needed
 			if (select_pending[SELECT_LIGHTS_CYCLE_SPEED] != NOT_SET) {
 				int changes = 0;
@@ -735,10 +848,11 @@ int IQ2020Component::processIQ2020Command() {
 			processingBuffer[cmdlen - 1] = 0;
 			std::string vstr((char*)(processingBuffer + 7));
 			versionstr = vstr;
+			version_polling_done = true;
 #ifdef USE_TEXT_SENSOR
 			if (this->version_sensor_) this->version_sensor_->publish_state(versionstr);
 #endif
-			ESP_LOGD(TAG, "Version: %d", versionstr.c_str());
+			ESP_LOGD(TAG, "Version: %s", versionstr.c_str());
 			pollState();
 		}
 
@@ -758,19 +872,27 @@ int IQ2020Component::processIQ2020Command() {
 			}
 #endif
 			if (g_iq2020_climate != NULL) {
-				if (temp_celsius) { g_iq2020_climate->updateTempsC(target_temp, current_temp, temp_action); }
-				else { g_iq2020_climate->updateTempsF(target_temp, current_temp, temp_action); }
+				if (temp_celsius) { g_iq2020_climate->updateTempsC(target_temp, current_temp, climateActionCode()); }
+				else { g_iq2020_climate->updateTempsF(target_temp, current_temp, climateActionCode()); }
 			}
 			next_poll = ::millis() + 5000; // Perform state polling in the next 5 seconds to update heater status.
 		}
 
 		if (((cmdlen == 140) && (processingBuffer[5] == 0x02) && (processingBuffer[6] == 0x56)) || ((cmdlen == 123) && (processingBuffer[5] == 0x02) && (processingBuffer[6] == 0x55))) {
 			// This is the main status data (jets, temperature)
-#ifdef USE_SELECT
-			if (!versionstr.empty() && ((select_state[SELECT_AUDIO_SOURCE] != NOT_SET) || (got_audio_data > 3))) { next_poll = ::millis() + (this->polling_rate_ * 1000); } // Next poll
+#ifdef USE_IQ2020_SELECT
+			if ((!versionstr.empty() || version_polling_done) && ((select_state[SELECT_AUDIO_SOURCE] != NOT_SET) || (got_audio_data > 3))) { next_poll = ::millis() + (this->polling_rate_ * 1000); } // Next poll
 #else
-			if (!versionstr.empty()) { next_poll = ::millis() + (this->polling_rate_ * 1000); } // Next poll
+			if (!versionstr.empty() || version_polling_done) { next_poll = ::millis() + (this->polling_rate_ * 1000); } // Next poll
 #endif
+
+			// Poll the coolzone heat pump right after our own status poll. When the official Spa Connection
+			// Kit is present (connectionKit > 1) it already polls the coolzone, so we stay silent and just
+			// listen to the responses to avoid adding needless RS485 bus traffic.
+			if (coolzone_enabled_ && (connectionKit <= 1) && (coolzone_present != 0)) {
+				unsigned char coolzonePollCmd[] = { 0x1D, 0x07, 0xFF };
+				sendIQ2020Command(0x01, 0x1F, 0x40, coolzonePollCmd, sizeof(coolzonePollCmd)); // Poll coolzone state
+			}
 
 			// Read state flags
 			unsigned char flags1 = processingBuffer[8];
@@ -811,15 +933,51 @@ int IQ2020Component::processIQ2020Command() {
 			float _target_temp = 0, _current_temp = 0;
 			if (processingBuffer[93] == 'F') { // Fahrenheit
 				temp_celsius = false;
-				_target_temp = ((processingBuffer[91] - '0') * 10) + (processingBuffer[92] - '0') + ((processingBuffer[90] == '1') ? 100 : 0);
-				_current_temp = ((processingBuffer[95] - '0') * 10) + (processingBuffer[96] - '0') + ((processingBuffer[94] == '1') ? 100 : 0);
-				outlet_temp = ((processingBuffer[37] - '0') * 10) + (processingBuffer[38] - '0') + ((processingBuffer[36] == '1') ? 100 : 0);
+
+				// Parse target temperature from fixed position (handles leading space for <100°F)
+				char target_temp_str[8];
+				memcpy(target_temp_str, &processingBuffer[90], 6);
+				target_temp_str[6] = '\0';
+				_target_temp = strtof(target_temp_str, nullptr);
+				if (std::isnan(_target_temp)) _target_temp = 0.0f;
+
+				// Parse current temperature from fixed position (handles leading space for <100°F)
+				char current_temp_str[8];
+				memcpy(current_temp_str, &processingBuffer[94], 6);
+				current_temp_str[6] = '\0';
+				_current_temp = strtof(current_temp_str, nullptr);
+				if (std::isnan(_current_temp)) _current_temp = 0.0f;
+
+				// Parse outlet temperature from fixed position
+				char outlet_temp_str[8];
+				memcpy(outlet_temp_str, &processingBuffer[36], 6);
+				outlet_temp_str[6] = '\0';
+				outlet_temp = strtof(outlet_temp_str, nullptr);
+				if (std::isnan(outlet_temp)) outlet_temp = 0.0f;
 			}
 			else if (processingBuffer[92] == '.') { // Celcius
 				temp_celsius = true;
-				_target_temp = ((processingBuffer[90] - '0') * 10) + (processingBuffer[91] - '0') + ((processingBuffer[93] - '0') * 0.1);
-				_current_temp = ((processingBuffer[94] - '0') * 10) + (processingBuffer[95] - '0') + ((processingBuffer[97] - '0') * 0.1);
-				outlet_temp = ((processingBuffer[36] - '0') * 10) + (processingBuffer[37] - '0') + ((processingBuffer[39] - '0') * 0.1);
+
+				// Parse target temperature from fixed position (handles leading space for <10°C)
+				char target_temp_str[8];
+				memcpy(target_temp_str, &processingBuffer[90], 4);
+				target_temp_str[5] = '\0';
+				_target_temp = strtof(target_temp_str, nullptr);
+				if (std::isnan(_target_temp)) _target_temp = 0.0f;
+
+				// Parse current temperature from fixed position (handles leading space for <10°C)
+				char current_temp_str[8];
+				memcpy(current_temp_str, &processingBuffer[94], 4);
+				current_temp_str[5] = '\0';
+				_current_temp = strtof(current_temp_str, nullptr);
+				if (std::isnan(_current_temp)) _current_temp = 0.0f;
+
+				// Parse outlet temperature from fixed position
+				char outlet_temp_str[8];
+				memcpy(outlet_temp_str, &processingBuffer[36], 4);
+				outlet_temp_str[5] = '\0';
+				outlet_temp = strtof(outlet_temp_str, nullptr);
+				if (std::isnan(outlet_temp)) outlet_temp = 0.0f;
 			}
 			ESP_LOGD(TAG, "Reported Current Temp: %.1f, Target Temp: %.1f, Outlet Temp: %.1f", _current_temp, _target_temp, outlet_temp);
 
@@ -829,8 +987,8 @@ int IQ2020Component::processIQ2020Command() {
 				current_temp = _current_temp;
 				temp_action = (heaterActive != 0);
 				if (g_iq2020_climate != NULL) {
-					if (temp_celsius) { g_iq2020_climate->updateTempsC(target_temp, current_temp, temp_action); }
-					else { g_iq2020_climate->updateTempsF(target_temp, current_temp, temp_action); }
+					if (temp_celsius) { g_iq2020_climate->updateTempsC(target_temp, current_temp, climateActionCode()); }
+					else { g_iq2020_climate->updateTempsF(target_temp, current_temp, climateActionCode()); }
 				}
 				ESP_LOGD(TAG, "Changed Current Temp: %.1f, Target Temp: %.1f, Action: %d", current_temp, target_temp, temp_action);
 			}
@@ -913,7 +1071,7 @@ int IQ2020Component::processIQ2020Command() {
 				// Format and publish RTC datetime in ISO 8601 format
 #ifdef USE_TEXT_SENSOR
 				if (this->rtc_datetime_sensor_) {
-					char datetime_str[20];
+					char datetime_str[32];
 					snprintf(datetime_str, sizeof(datetime_str), "%04d-%02d-%02d %02d:%02d:%02d",
 						year, month, day, hours, minutes, seconds);
 					this->rtc_datetime_sensor_->publish_state(datetime_str);
@@ -1072,10 +1230,17 @@ void IQ2020Component::switchAction(unsigned int switchid, int state) {
 			switch_state[switchid] = switch_pending[switchid] = state;
 		}
 		else
-		{   // Control a real ACE module
+		{   // Control a real salt module (legacy ACE or freshwater salt)
 			switch_pending[switchid] = state; // 0 = OFF, 1 = ON
-			unsigned char cmd[] = { 0x1E, 0x02, 0x03, (unsigned char)(state ? 0x08 : 0x00), 0x00 };
-			sendIQ2020Command(0x01, 0x1F, 0x40, cmd, sizeof(cmd));
+			if (salt_module_address == 0x29) {
+				unsigned char cmd[] = { 0x1E, 0x01, 0xFF, 0x02, 0xFF, 0xFF, (unsigned char)(state ? 0x01 : 0x02), 0x00, 0xFF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+				sendIQ2020Command(0x29, 0x01, 0x40, cmd, sizeof(cmd));
+				next_poll = ::millis() + 100;
+			}
+			else {
+				unsigned char cmd[] = { 0x1E, 0x02, 0x03, (unsigned char)(state ? 0x08 : 0x00), 0x00 };
+				sendIQ2020Command(0x01, 0x1F, 0x40, cmd, sizeof(cmd));
+			}
 		}
 		break;
 	}
@@ -1099,7 +1264,7 @@ void IQ2020Component::switchAction(unsigned int switchid, int state) {
 	next_retry = ::millis() + SWITCH_RETRY_TIME;
 }
 
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 void IQ2020Component::selectAction(unsigned int selectid, int state) {
 	ESP_LOGD(TAG, "selectAction, selectid = %d, state = %d", selectid, state);
 	switch (selectid) {
@@ -1161,7 +1326,7 @@ void IQ2020Component::selectAction(unsigned int selectid, int state) {
 }
 #endif
 
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 void IQ2020Component::numberAction(unsigned int numberid, int value) {
 	ESP_LOGD(TAG, "numberAction, numberid = %d, value = %d", numberid, value);
 	number_pending[numberid] = value;
@@ -1209,9 +1374,16 @@ void IQ2020Component::numberAction(unsigned int numberid, int value) {
 	}
 	case NUMBER_SALT_POWER:
 	{
+		if (value < 1 || value > 10) return;
 		number_pending[NUMBER_SALT_POWER] = value;
-		unsigned char cmd[] = { 0x1E, 0x02, 0x01, (unsigned char)value, 0x00 };
-		sendIQ2020Command(0x01, 0x1F, 0x40, cmd, sizeof(cmd)); // Change salt power
+		if (salt_module_address == 0x29) {
+			unsigned char cmd[] = { 0x1E, 0x01, (unsigned char)value, 0x02, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+			sendIQ2020Command(0x29, 0x01, 0x40, cmd, sizeof(cmd)); // Freshwater salt command
+		}
+		else {
+			unsigned char cmd[] = { 0x1E, 0x02, 0x01, (unsigned char)value, 0x00 };
+			sendIQ2020Command(0x01, 0x1F, 0x40, cmd, sizeof(cmd)); // Legacy ACE-style command
+		}
 		break;
 	}
 	case NUMBER_SALT_STATUS:
@@ -1256,6 +1428,31 @@ void IQ2020Component::numberAction(unsigned int numberid, int value) {
 }
 #endif
 
+#ifdef USE_IQ2020_BUTTON
+void IQ2020Component::buttonAction(unsigned int buttonid) {
+	unsigned char cmd[] = { 0x1E, 0x01, 0xFF, 0x02, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+	switch (buttonid) {
+	case BUTTON_SALT_TEST:
+		cmd[11] = 0x01; // FF 01 FF 01
+		sendIQ2020Command(0x29, 0x01, 0x40, cmd, sizeof(cmd));
+		break;
+	case BUTTON_RESET_CARTRIDGE:
+		cmd[8] = 0x02;  // 02 01 02 FF
+		cmd[10] = 0x02;
+		cmd[11] = 0xFF;
+		sendIQ2020Command(0x29, 0x01, 0x40, cmd, sizeof(cmd));
+		break;
+	case BUTTON_CONFIRM_MANUAL_TEST:
+		cmd[8] = 0x01; // 01 01 FF FF
+		sendIQ2020Command(0x29, 0x01, 0x40, cmd, sizeof(cmd));
+		break;
+	default:
+		return;
+	}
+	next_poll = ::millis() + 100;
+}
+#endif
+
 void IQ2020Component::setTempAction(float newtemp) {
 	//ESP_LOGD(TAG, "setTempAction: new=%f", newtemp);
 
@@ -1296,7 +1493,7 @@ void IQ2020Component::setSwitchState(unsigned int switchid, int state) {
 
 // Update the state of a selector
 // If you set state to NOT_SET, that indicates that whatever state we wanted to go to, we got a confirmation.
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 void IQ2020Component::setSelectState(unsigned int selectid, int state) {
 	ESP_LOGD(TAG, "setSelectState, selectid = %d, status = %d", selectid, state);
 	if (state == NOT_SET) {
@@ -1314,7 +1511,7 @@ void IQ2020Component::setSelectState(unsigned int selectid, int state) {
 
 // Update the state of a number
 // If you set state to NOT_SET, that indicates that whatever state we wanted to go to, we got a confirmation.
-#ifdef USE_NUMBER
+#ifdef USE_IQ2020_NUMBER
 void IQ2020Component::setNumberState(unsigned int numberid, int value) {
 	ESP_LOGD(TAG, "setNumberState, numberid = %d, value = %d", numberid, value);
 	if (value == NOT_SET) {
@@ -1330,16 +1527,55 @@ void IQ2020Component::setNumberState(unsigned int numberid, int value) {
 }
 #endif
 
+// Compute the current climate action code by combining the induction heater state (temp_action)
+// with the coolzone compressor state, when coolzone is enabled.
+int IQ2020Component::climateActionCode() {
+	bool induction = (temp_action != NOT_SET) && (temp_action != 0);
+	if (coolzone_enabled_) {
+		if (coolzone_state == COOLZONE_STATE_COOLING) { return CLIMATE_ACT_COOLING; }
+		if (induction || (coolzone_state == COOLZONE_STATE_HEATING)) { return CLIMATE_ACT_HEATING; }
+		if (coolzone_state == COOLZONE_STATE_STANDBY) { return CLIMATE_ACT_IDLE; }
+		if (coolzone_state == COOLZONE_STATE_OFF) { return CLIMATE_ACT_OFF; }
+	}
+	return induction ? CLIMATE_ACT_HEATING : CLIMATE_ACT_OFF;
+}
+
+// Set the coolzone heat pump mode (0x00 to 0x04) by sending command 0x1D07.
+void IQ2020Component::setCoolzoneMode(int mode) {
+	if ((mode < 0) || (mode > 0x04)) { return; }
+	ESP_LOGD(TAG, "setCoolzoneMode, mode = %d", mode);
+	unsigned char cmd[] = { 0x1D, 0x07, (unsigned char)mode, 0x00 };
+	sendIQ2020Command(0x01, 0x1F, 0x40, cmd, sizeof(cmd)); // Set coolzone mode
+	next_poll = ::millis() + 100; // Poll soon to confirm the new state
+}
+
 void IQ2020Component::pollState() {
 	// If we don't have the version string, fetch it now.
-	if (versionstr.empty()) {
-		ESP_LOGD(TAG, "Poll Version");
-		unsigned char cmd[] = { 0x01, 0x00 };
-		sendIQ2020Command(0x01, 0x1F, 0x40, cmd, sizeof(cmd)); // Get version string
-		return;
+	if (versionstr.empty() && !version_polling_done) {
+#ifdef USE_TEXT_SENSOR
+		if (this->version_sensor_ == nullptr) {
+			// Version sensor not configured, don't bother polling for the version.
+			version_polling_done = true;
+		}
+		else if (version_poll_count >= 10) {
+			// Give up after 10 tries and continue with an empty version string.
+			ESP_LOGE(TAG, "Failed to get version after %d tries, continuing without it", version_poll_count);
+			version_polling_done = true;
+		}
+		else {
+			ESP_LOGD(TAG, "Poll Version");
+			version_poll_count++;
+			unsigned char cmd[] = { 0x01, 0x00 };
+			sendIQ2020Command(0x01, 0x1F, 0x40, cmd, sizeof(cmd)); // Get version string
+			return;
+		}
+#else
+		// Text sensors aren't compiled in, so the version can't be configured; skip polling for it.
+		version_polling_done = true;
+#endif
 	}
 
-#ifdef USE_SELECT
+#ifdef USE_IQ2020_SELECT
 	// If we don't have the audio status, fetch it now.
 	if ((got_audio_data < 3) && (select_state[SELECT_AUDIO_SOURCE] == NOT_SET || switch_state[SWITCH_AUDIO_POWER] == NOT_SET)) {
 		ESP_LOGD(TAG, "Poll Audio");
