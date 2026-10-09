@@ -43,8 +43,7 @@ wifi:
 captive_portal:
 
 external_components:
-  - source: github://ylianst/esp-iq2020
-    refresh: 30s
+  - source: ../
 
 uart:
   id: SpaConnection
